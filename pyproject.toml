@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ad-fallback"
+version = "1.0.0"
+description = "Export HTML ads as exact-size JPEG fallbacks and ZIP archives"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["playwright>=1.49,<2"]
+
+[project.scripts]
+ad-fallback = "ad_fallback:main"
+
+[tool.setuptools]
+py-modules = ["ad_fallback"]
