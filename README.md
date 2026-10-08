@@ -66,16 +66,21 @@ cd /path/to/ads
 ad-fallback 10
 ```
 
+Up to six ads render concurrently in separate contexts within one Chromium
+instance. Each ad waits the specified delay after its own load event. Progress
+lines include the folder name because messages can interleave.
+
 ```text
 Found 3 ads.
 
 [1/3] 300x250
-    Loading ad...
-    Waiting 10 seconds...
-    Screenshot: 300x250.jpg
-    ZIP: 300x250.zip
-    Removed folder: 300x250
-    Done
+  [300x250] Loading ad...
+  [300x250] Waiting 10 seconds...
+...
+  [300x250] Screenshot: 300x250.jpg
+  [300x250] ZIP: 300x250.zip
+  [300x250] Removed folder: 300x250
+  [300x250] Done
 ...
 Finished: 3 succeeded, 0 failed.
 ```
@@ -97,7 +102,8 @@ This takes priority over dimensions in the folder name. A folder named
 
 ## Behavior and limitations
 
-- Only immediate subdirectories are considered, in name order. The first valid
+- Only immediate subdirectories are considered, queued in name order and
+  processed up to six at a time; completion order can vary. The first valid
   `ad.size` meta tag in `index.html` supplies positive integer width and height.
   Attribute order, dimension order, and surrounding whitespace do not matter.
   Missing or invalid metadata falls back to a folder name of exactly
@@ -151,6 +157,7 @@ AD_FALLBACK_BROWSER_TESTS=1 .venv/bin/python -m unittest discover -s tests -v
 
 The final command also runs an end-to-end Chromium test that checks decoded JPEG
 dimensions, rendered pixels, asset loading, overwrites, and failure continuation.
+Unit tests also check the six-ad concurrency limit and cancellation cleanup.
 
 Run `.venv/bin/ad-fallback 10` from an ads directory, using an absolute path to
 the executable when necessary. For a global install without pipx, install into

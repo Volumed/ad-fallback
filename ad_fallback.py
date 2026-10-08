@@ -1,6 +1,7 @@
 """Render HTML ads in Chromium and archive their original assets."""
 
 import argparse
+import asyncio
 from contextlib import contextmanager
 from functools import partial
 from html.parser import HTMLParser
@@ -13,12 +14,12 @@ from shutil import rmtree
 import sys
 from tempfile import TemporaryDirectory
 from threading import Thread
-import time
 from urllib.parse import quote
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
 SIZE_PATTERN = re.compile(r"([1-9][0-9]*)x([1-9][0-9]*)")
+MAX_CONCURRENT_ADS = 12
 
 
 class AdSizeParser(HTMLParser):
@@ -95,45 +96,45 @@ def serve_ads(root: Path):
         thread.join()
 
 
-def capture_ad(browser, folder: Path, width: int, height: int,
-               base_url: str, seconds: float, destination: Path) -> None:
+async def capture_ad(browser, folder: Path, width: int, height: int,
+                     base_url: str, seconds: float, destination: Path) -> None:
     if not (folder / "index.html").is_file():
         raise FileNotFoundError(f"{folder.name}/index.html is missing")
-    context = browser.new_context(
+    context = await browser.new_context(
         viewport={"width": width, "height": height},
         device_scale_factor=1,
     )
     try:
-        page = context.new_page()
+        page = await context.new_page()
         warnings: set[str] = set()
 
         def warn(message: str) -> None:
             if message not in warnings:
                 warnings.add(message)
-                print(f"    Warning: {message}", flush=True)
+                print(f"    [{folder.name}] Warning: {message}", flush=True)
 
         page.on("pageerror", lambda error: warn(f"JavaScript: {error}"))
         page.on("requestfailed", lambda request: warn(
             f"Asset request failed: {request.url} ({request.failure})"))
         page.on("response", lambda response: warn(
             f"HTTP {response.status}: {response.url}") if response.status >= 400 else None)
-        print("    Loading ad...", flush=True)
-        response = page.goto(
+        print(f"    [{folder.name}] Loading ad...", flush=True)
+        response = await page.goto(
             f"{base_url}/{quote(folder.name)}/index.html",
             wait_until="load", timeout=30_000,
         )
         if response is not None and response.status >= 400:
             raise RuntimeError(f"index.html returned HTTP {response.status}")
-        print(f"    Waiting {seconds:g} seconds...", flush=True)
-        time.sleep(seconds)
-        page.screenshot(
+        print(f"    [{folder.name}] Waiting {seconds:g} seconds...", flush=True)
+        await asyncio.sleep(seconds)
+        await page.screenshot(
             path=str(destination), type="jpeg", quality=90,
             full_page=False, animations="allow",
             clip={"x": 0, "y": 0, "width": width, "height": height},
             timeout=30_000,
         )
     finally:
-        context.close()
+        await context.close()
 
 
 def archive_ad(folder: Path, destination: Path) -> None:
@@ -144,43 +145,72 @@ def archive_ad(folder: Path, destination: Path) -> None:
             archive.write(asset, asset.relative_to(folder).as_posix())
 
 
-def export_ads(browser, ads: list[tuple[Path, int, int]],
-               base_url: str, seconds: float) -> int:
-    failed = 0
-    for position, (folder, width, height) in enumerate(ads, start=1):
-        print(f"\n[{position}/{len(ads)}] {folder.name}", flush=True)
-        errors = []
-        zip_created = False
-        with TemporaryDirectory(prefix=".ad-fallback-", dir=folder.parent) as temporary:
-            staging = Path(temporary)
-            for suffix, label in (("jpg", "Screenshot"), ("zip", "ZIP")):
-                filename = f"{folder.name}.{suffix}"
-                output = staging / filename
-                try:
-                    if suffix == "jpg":
-                        capture_ad(browser, folder, width, height, base_url, seconds, output)
-                    else:
-                        archive_ad(folder, output)
-                    os.replace(output, folder.parent / filename)
-                    if suffix == "zip":
-                        zip_created = True
-                    print(f"    {label}: {filename}", flush=True)
-                except Exception as error:
-                    errors.append(f"{label}: {error}")
-                    print(f"    Error: {label}: {error}", file=sys.stderr, flush=True)
-        if zip_created:
+async def export_ads(browser, ads: list[tuple[Path, int, int]],
+                     base_url: str, seconds: float) -> int:
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_ADS)
+
+    async def export_one(position: int, folder: Path, width: int, height: int) -> bool:
+        async with semaphore:
             try:
-                rmtree(folder)
-                print(f"    Removed folder: {folder.name}", flush=True)
+                return await export_ad(browser, folder, width, height, base_url, seconds,
+                                       position, len(ads))
             except Exception as error:
-                errors.append(f"Cleanup: {error}")
-                print(f"    Error: Cleanup: {error}", file=sys.stderr, flush=True)
-        if errors:
-            failed += 1
-            print("    Failed (continuing)", flush=True)
-        else:
-            print("    Done", flush=True)
-    return failed
+                print(f"    [{folder.name}] Error: {error}", file=sys.stderr, flush=True)
+                return True
+
+    results = await asyncio.gather(*(
+        export_one(position, folder, width, height)
+        for position, (folder, width, height) in enumerate(ads, start=1)
+    ))
+    return sum(results)
+
+
+async def export_ad(browser, folder: Path, width: int, height: int,
+                    base_url: str, seconds: float, position: int, total: int) -> bool:
+    print(f"\n[{position}/{total}] {folder.name}", flush=True)
+    errors = []
+    zip_created = False
+    with TemporaryDirectory(prefix=".ad-fallback-", dir=folder.parent) as temporary:
+        staging = Path(temporary)
+        for suffix, label in (("jpg", "Screenshot"), ("zip", "ZIP")):
+            filename = f"{folder.name}.{suffix}"
+            output = staging / filename
+            try:
+                if suffix == "jpg":
+                    await capture_ad(browser, folder, width, height, base_url, seconds, output)
+                else:
+                    archive_ad(folder, output)
+                os.replace(output, folder.parent / filename)
+                if suffix == "zip":
+                    zip_created = True
+                print(f"    [{folder.name}] {label}: {filename}", flush=True)
+            except Exception as error:
+                errors.append(f"{label}: {error}")
+                print(f"    [{folder.name}] Error: {label}: {error}", file=sys.stderr, flush=True)
+    if zip_created:
+        try:
+            rmtree(folder)
+            print(f"    [{folder.name}] Removed folder: {folder.name}", flush=True)
+        except Exception as error:
+            errors.append(f"Cleanup: {error}")
+            print(f"    [{folder.name}] Error: Cleanup: {error}", file=sys.stderr, flush=True)
+    if errors:
+        print(f"    [{folder.name}] Failed (continuing)", flush=True)
+    else:
+        print(f"    [{folder.name}] Done", flush=True)
+    return bool(errors)
+
+
+async def run_exports(root: Path, ads: list[tuple[Path, int, int]], seconds: float) -> int:
+    from playwright.async_api import async_playwright
+
+    with serve_ads(root) as base_url:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                return await export_ads(browser, ads, base_url, seconds)
+            finally:
+                await browser.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -200,14 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             print("No ad folders found: use ad.size metadata in index.html or "
                 "WIDTHxHEIGHT folder names in the current directory.", file=sys.stderr)
             return 1
-        from playwright.sync_api import sync_playwright
-
-        with serve_ads(root) as base_url, sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            try:
-                failed = export_ads(browser, ads, base_url, args.seconds)
-            finally:
-                browser.close()
+        failed = asyncio.run(run_exports(root, ads, args.seconds))
         print(f"\nFinished: {len(ads) - failed} succeeded, {failed} failed.", flush=True)
         return 1 if failed else 0
     except KeyboardInterrupt:

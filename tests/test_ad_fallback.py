@@ -1,4 +1,5 @@
 from contextlib import redirect_stderr, redirect_stdout
+import asyncio
 import io
 import os
 from pathlib import Path
@@ -6,14 +7,14 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.request import urlopen
 from zipfile import ZipFile
 
 import ad_fallback
 
 
-class AdFallbackTests(unittest.TestCase):
+class AdFallbackTests(unittest.IsolatedAsyncioTestCase):
     def test_seconds_validation(self):
         self.assertEqual(ad_fallback.parse_seconds("10"), 10)
         self.assertEqual(ad_fallback.parse_seconds("0.5"), 0.5)
@@ -83,20 +84,26 @@ class AdFallbackTests(unittest.TestCase):
                 ad_fallback.archive_ad(root / "300x250", destination)
             self.assertFalse(destination.exists())
 
-    def test_capture_waits_after_load_and_uses_exact_jpeg_size(self):
+    async def test_capture_waits_after_load_and_uses_exact_jpeg_size(self):
         with TemporaryDirectory() as temporary:
             folder = Path(temporary) / "300x250"
             folder.mkdir()
             (folder / "index.html").touch()
             browser = Mock()
-            page = browser.new_context.return_value.new_page.return_value
+            context = Mock()
+            page = Mock()
+            browser.new_context = AsyncMock(return_value=context)
+            context.new_page = AsyncMock(return_value=page)
+            context.close = AsyncMock()
+            page.goto = AsyncMock()
+            page.screenshot = AsyncMock()
             page.goto.return_value.status = 200
             events = []
             page.goto.side_effect = lambda *args, **kwargs: events.append("loaded")
             page.screenshot.side_effect = lambda **kwargs: events.append("screenshot")
-            with patch("ad_fallback.time.sleep", side_effect=lambda seconds: events.append(seconds)):
-                ad_fallback.capture_ad(browser, folder, 300, 250, "http://localhost:1234", 10,
-                                       folder.parent / "300x250.jpg")
+            with patch("ad_fallback.asyncio.sleep", side_effect=lambda seconds: events.append(seconds)):
+                await ad_fallback.capture_ad(browser, folder, 300, 250, "http://localhost:1234", 10,
+                                             folder.parent / "300x250.jpg")
             self.assertEqual(events, ["loaded", 10, "screenshot"])
             browser.new_context.assert_called_once_with(
                 viewport={"width": 300, "height": 250}, device_scale_factor=1)
@@ -105,9 +112,9 @@ class AdFallbackTests(unittest.TestCase):
             self.assertEqual(page.screenshot.call_args.kwargs["quality"], 90)
             self.assertEqual(page.screenshot.call_args.kwargs["clip"],
                              {"x": 0, "y": 0, "width": 300, "height": 250})
-            browser.new_context.return_value.close.assert_called_once()
+            context.close.assert_awaited_once()
 
-    def test_failure_continuation_overwrite_and_cleanup(self):
+    async def test_failure_continuation_overwrite_and_cleanup(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             broken = root / "300x250"
@@ -118,14 +125,14 @@ class AdFallbackTests(unittest.TestCase):
             (root / "728x90.jpg").write_bytes(b"old")
             (root / "728x90.zip").write_bytes(b"old")
 
-            def capture(browser, folder, width, height, url, seconds, output):
+            async def capture(browser, folder, width, height, url, seconds, output):
                 if folder == broken:
                     raise RuntimeError("failed render")
                 output.write_bytes(b"new jpeg")
 
             with patch("ad_fallback.capture_ad", side_effect=capture), \
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                failed = ad_fallback.export_ads(Mock(), ad_fallback.find_ads(root), "http://localhost", 0)
+                failed = await ad_fallback.export_ads(Mock(), ad_fallback.find_ads(root), "http://localhost", 0)
             self.assertEqual(failed, 1)
             self.assertEqual((root / "728x90.jpg").read_bytes(), b"new jpeg")
             self.assertTrue((root / "300x250.zip").is_file())
@@ -135,7 +142,7 @@ class AdFallbackTests(unittest.TestCase):
             self.assertFalse(broken.exists())
             self.assertEqual(list(root.glob(".ad-fallback-*")), [])
 
-    def test_zip_failure_preserves_source_and_existing_archive(self):
+    async def test_zip_failure_preserves_source_and_existing_archive(self):
         for stage in ("archive", "replace"):
             with self.subTest(stage=stage), TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -157,14 +164,14 @@ class AdFallbackTests(unittest.TestCase):
                         patch("ad_fallback.os.replace",
                               side_effect=replace_output if stage == "replace" else replace), \
                         redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    failed = ad_fallback.export_ads(
+                    failed = await ad_fallback.export_ads(
                         Mock(), ad_fallback.find_ads(root), "http://localhost", 0)
                 self.assertEqual(failed, 1)
                 self.assertEqual((folder / "index.html").read_bytes(), b"original")
                 self.assertEqual((root / "300x250.zip").read_bytes(), b"old archive")
                 self.assertEqual(list(root.glob(".ad-fallback-*")), [])
 
-    def test_cleanup_failure_keeps_zip_and_continues(self):
+    async def test_cleanup_failure_keeps_zip_and_continues(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name in ("300x250", "728x90"):
@@ -181,7 +188,7 @@ class AdFallbackTests(unittest.TestCase):
                        side_effect=lambda *args: args[-1].write_bytes(b"jpeg")), \
                     patch("ad_fallback.rmtree", side_effect=remove_folder), \
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
-                failed = ad_fallback.export_ads(
+                failed = await ad_fallback.export_ads(
                     Mock(), ad_fallback.find_ads(root), "http://localhost", 0)
             self.assertEqual(failed, 1)
             self.assertIn("Error: Cleanup: Permission denied", stderr.getvalue())
@@ -190,6 +197,88 @@ class AdFallbackTests(unittest.TestCase):
             for name in ("300x250", "728x90"):
                 with ZipFile(root / f"{name}.zip") as archive:
                     self.assertEqual(archive.read("index.html"), b"original")
+
+    async def test_concurrent_exports_are_limited_to_six(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for width in range(100, 108):
+                folder = root / f"{width}x100"
+                folder.mkdir()
+                (folder / "index.html").write_bytes(b"original")
+            active = 0
+            peak = 0
+            started = []
+            first_batch = asyncio.Event()
+            release = asyncio.Event()
+
+            async def capture(browser, folder, width, height, url, seconds, output):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                started.append(folder.name)
+                if len(started) == 6:
+                    first_batch.set()
+                try:
+                    await release.wait()
+                    if folder.name == "100x100":
+                        raise RuntimeError("failed render")
+                    output.write_bytes(b"jpeg")
+                finally:
+                    active -= 1
+
+            with patch("ad_fallback.capture_ad", side_effect=capture), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                task = asyncio.create_task(ad_fallback.export_ads(
+                    Mock(), ad_fallback.find_ads(root), "http://localhost", 0))
+                try:
+                    await asyncio.wait_for(first_batch.wait(), timeout=2)
+                    self.assertEqual(active, 6)
+                    self.assertEqual(len(started), 6)
+                finally:
+                    release.set()
+                    failed = await task
+            self.assertEqual(failed, 1)
+            self.assertEqual(peak, 6)
+            self.assertEqual(len(started), 8)
+            self.assertEqual(len(list(root.glob("*.zip"))), 8)
+            self.assertEqual(len(list(root.glob("*.jpg"))), 7)
+            self.assertFalse(any(path.is_dir() for path in root.iterdir()))
+
+    async def test_cancelling_exports_cleans_staging_and_preserves_sources(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for width in range(100, 107):
+                folder = root / f"{width}x100"
+                folder.mkdir()
+                (folder / "index.html").write_bytes(b"original")
+            started = []
+            cancelled = []
+            first_batch = asyncio.Event()
+
+            async def capture(browser, folder, width, height, url, seconds, output):
+                started.append(folder.name)
+                if len(started) == 6:
+                    first_batch.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.append(folder.name)
+
+            with patch("ad_fallback.capture_ad", side_effect=capture), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                task = asyncio.create_task(ad_fallback.export_ads(
+                    Mock(), ad_fallback.find_ads(root), "http://localhost", 10))
+                try:
+                    await asyncio.wait_for(first_batch.wait(), timeout=2)
+                finally:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+            self.assertEqual(len(started), 6)
+            self.assertCountEqual(cancelled, started)
+            self.assertEqual(list(root.glob(".ad-fallback-*")), [])
+            self.assertEqual(len(list(root.glob("*/index.html"))), 7)
+            self.assertEqual(list(root.glob("*.zip")), [])
 
     def test_http_serves_relative_assets(self):
         with TemporaryDirectory() as temporary:
@@ -215,7 +304,8 @@ class BrowserIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             (root / "100x100").mkdir()
             originals = {}
-            for name in ("300x250", "728x90"):
+            names = ("300x250", "728x90", "160x600", "300x600", "320x50", "970x250", "468x60")
+            for name in names:
                 folder = root / name
                 (folder / "assets").mkdir(parents=True)
                 html = (
@@ -240,7 +330,7 @@ class BrowserIntegrationTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("Finished: 2 succeeded, 1 failed.", result.stdout)
+            self.assertIn("Finished: 7 succeeded, 1 failed.", result.stdout)
             self.assertIn("JavaScript: test warning", result.stdout)
             self.assertIn("HTTP 404:", result.stdout)
             self.assertIn("index.html is missing", result.stderr)
@@ -249,7 +339,7 @@ class BrowserIntegrationTests(unittest.TestCase):
                 try:
                     page = browser.new_page()
                     page.goto(base_url)
-                    for name in ("300x250", "728x90"):
+                    for name in names:
                         self.assertTrue((root / f"{name}.jpg").read_bytes().startswith(b"\xff\xd8"))
                         image = page.evaluate("""async (url) => {
                             const image = await createImageBitmap(await (await fetch(url)).blob());
